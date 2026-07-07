@@ -62,3 +62,13 @@ https://api.telegram.org/bot123456:ABCDEFG/setWebhook?url=https://relaygobot.exa
 一般情况下，机器人会自动绑定群组。如果自动绑定没有生效，请在群组中发送 `/bind` 命令手动绑定。
 
 一切准备就绪，可以开始使用了！
+
+-----
+
+### 附：更新自部署机器人教程
+
+前往 `Cloudflare Dashboard`->`Compute & AI`（`计算和 AI`）->`Workers & Pages`->`relaygobot`。
+
+点击右上角 `Edit Code`（`编辑代码`），将代码替换为最新版的 [worker.js](https://github.com/abcxyz-123456/RelayGo/blob/main/worker.js) ，并点击右上角 `Deploy`（`部署`）。
+
+部署成功后，最新版本的机器人将立即生效。
