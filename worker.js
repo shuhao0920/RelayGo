@@ -1,7 +1,7 @@
 /**
  * RelayGo - 新一代 Telegram 私聊机器人
  * 项目地址: https://github.com/abcxyz-123456/RelayGo
- * 版本: 1.1.6 (Standalone)
+ * 版本: 1.1.7 (Standalone)
  * 官方频道：https://t.me/RelayGo
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
@@ -56,6 +56,32 @@ async function tgRequest(token, method, payload) {
         console.error(`[Network Error] Method: ${method}, Error:`, e);
         return { ok: false, description: e.message };
     }
+}
+
+function isTopicNotFoundError(result) {
+    if (!result || result.ok) return false;
+    const desc = (result.description || '').toLowerCase();
+    return desc.includes('message thread not found')
+        || desc.includes('topic deleted')
+        || desc.includes('topic not found')
+        || desc.includes('forum topic deleted');
+}
+
+async function clearStaleTopicMapping(env, userId, threadId) {
+    const userKey = `user:${userId}`;
+    const userData = await env.KV.get(userKey, { type: 'json' });
+    if (userData) {
+        delete userData.thread_id;
+        const hasOtherData = userData.is_banned || userData.user_info;
+        if (hasOtherData) {
+            await env.KV.put(userKey, JSON.stringify(userData));
+        } else {
+            await env.KV.delete(userKey);
+        }
+    }
+    if (threadId) await env.KV.delete(`thread:${threadId}`);
+    memDelete(userKey);
+    console.log(`[TopicRecovery] Cleared stale mapping for user ${userId}, thread ${threadId}`);
 }
 
 // 中心化 API 调用
@@ -318,6 +344,19 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
         if (buffer.threadId) payload.message_thread_id = buffer.threadId;
         return tgRequest(buffer.token, 'copyMessages', payload);
     }
+}
+
+async function forwardToGroupWithRecovery(env, token, groupId, userId, msg, threadId, userData) {
+    const result = await forwardMessage(env, token, groupId, userId, msg, threadId);
+    if (result === undefined) return;
+    if (result.ok || !isTopicNotFoundError(result)) {
+        if (!result.ok) console.error(`[ForwardError] user ${userId}: ${result.description}`);
+        return result;
+    }
+
+    console.log(`[TopicRecovery] Topic ${threadId} missing for user ${userId}, recreating session`);
+    await clearStaleTopicMapping(env, userId, threadId);
+    return initializeUser(env, groupId, msg, userId, token, { recreate: true, preserveBan: userData?.is_banned });
 }
 
 // 设置菜单
@@ -659,7 +698,12 @@ async function handleUserPrivateMessage(env, groupId, msg) {
                 }
             }
         }
-        return forwardMessage(env, token, groupId, userId, msg, userData.thread_id);
+        return forwardToGroupWithRecovery(env, token, groupId, userId, msg, userData.thread_id, userData);
+    }
+
+    // 曾接入但话题映射丢失（如话题被删后清理不完整）
+    if (userData && userData.user_info && !userData.thread_id) {
+        return initializeUser(env, groupId, msg, userId, token, { recreate: true, preserveBan: userData.is_banned });
     }
 
     // 新用户验证
@@ -742,7 +786,8 @@ async function handleLocalVerification(env, groupId, msg, userId, token, mode) {
     }
 }
 
-async function initializeUser(env, groupId, msg, userId, token) {
+async function initializeUser(env, groupId, msg, userId, token, options = {}) {
+    const { recreate = false, preserveBan = false } = options;
     if (!groupId) return tgRequest(token, 'sendMessage', { chat_id: userId, text: "⚠️ 机器人未绑定群组" });
 
     try {
@@ -760,28 +805,32 @@ async function initializeUser(env, groupId, msg, userId, token) {
         // 1. User -> Thread + Info
         const userData = {
             thread_id: threadId,
-            is_banned: false,
+            is_banned: preserveBan || false,
             user_info: msg.from
         };
         await env.KV.put(`user:${userId}`, JSON.stringify(userData));
+        memSet(`user:${userId}`, userData);
 
         // 2. Thread -> User (用于快速反查)
         await env.KV.put(`thread:${threadId}`, String(userId));
 
-        // 新用户通知
         const firstName = escapeHtml(msg.from.first_name || '');
         const lastName = escapeHtml(msg.from.last_name || '');
         const fullName = (firstName + ' ' + lastName).trim() || 'No Name';
         const uidLink = `tg://user?id=${userId}`;
         const username = msg.from.username ? `@${escapeHtml(msg.from.username)}` : 'None';
 
-        const infoMsg = `👤 <b>新用户接入</b>\n\n` +
-            `🔸 名称：<a href="${uidLink}">${fullName}</a>\n` +
-            `🆔 UID：${userId}\n` +
+        const userDetails =
+            `🔸 名称：${fullName}\n` +
+            `🆔 UID：<a href="${uidLink}">${userId}</a>\n` +
             `💫 用户名：${username}`;
 
-        await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML' });
-        await sendWelcomeMessage(env, userId);
+        const infoMsg = recreate
+            ? `⚠️ <b>会话已恢复</b>\n\n原话题已被删除，已自动创建新会话。\n\n${userDetails}`
+            : `👤 <b>新用户接入</b>\n\n${userDetails}`;
+
+        await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: "👉 点击查看", url: uidLink }]] } });
+        if (!recreate) await sendWelcomeMessage(env, userId);
 
         if (!msg.text || !msg.text.startsWith('/start')) {
             await forwardMessage(env, token, groupId, userId, msg, threadId);
