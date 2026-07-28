@@ -1,7 +1,7 @@
 /**
  * RelayGo - 新一代 Telegram 私聊机器人
  * 项目地址: https://github.com/abcxyz-123456/RelayGo
- * 版本: 1.1.7 (Standalone)
+ * 版本: 1.1.8 (Standalone)
  * 官方频道：https://t.me/RelayGo
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
  */
@@ -38,6 +38,105 @@ function memDelete(key) { memCache.delete(key); }
 function escapeHtml(unsafe) {
     if (typeof unsafe !== 'string') return String(unsafe || '');
     return unsafe.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function utf16Length(str) {
+    let len = 0;
+    for (const ch of str) {
+        len += (ch.codePointAt(0) || 0) > 0xFFFF ? 2 : 1;
+    }
+    return len;
+}
+
+function getMessageTextContent(msg) {
+    if (msg.text) return msg.text;
+    if (msg.caption) return msg.caption;
+    if (msg.photo) return '[图片]';
+    if (msg.video) return '[视频]';
+    if (msg.voice) return '[语音]';
+    if (msg.audio) return '[音频]';
+    if (msg.document) return msg.document.file_name || '[文件]';
+    if (msg.sticker) return (msg.sticker.emoji || '') + ' [贴纸]';
+    if (msg.animation) return '[GIF]';
+    if (msg.video_note) return '[视频消息]';
+    if (msg.contact) return `[联系人] ${msg.contact.first_name || ''}`;
+    if (msg.location) return '[位置]';
+    if (msg.poll) return `[投票] ${msg.poll.question || ''}`;
+    return '[消息]';
+}
+
+function buildReplyPrefix(replyToMsg) {
+    const prefix = '回复： ';
+    const quotedText = getMessageTextContent(replyToMsg);
+    const separator = '\n\n';
+    return {
+        prefix,
+        quotedText,
+        separator,
+        headerLength: utf16Length(prefix + quotedText + separator),
+        blockquoteOffset: utf16Length(prefix),
+        blockquoteLength: utf16Length(quotedText),
+    };
+}
+
+function shiftEntities(entities, offset) {
+    if (!entities?.length) return undefined;
+    return entities.map(e => ({ ...e, offset: e.offset + offset }));
+}
+
+function buildReplyEntities(prefixInfo, contentEntities) {
+    const entities = [{ type: 'blockquote', offset: prefixInfo.blockquoteOffset, length: prefixInfo.blockquoteLength }];
+    const shifted = shiftEntities(contentEntities, prefixInfo.headerLength);
+    if (shifted) entities.push(...shifted);
+    return entities;
+}
+
+function isTextOnlyMessage(msg) {
+    return msg.text !== undefined && !msg.photo && !msg.video && !msg.document && !msg.audio
+        && !msg.voice && !msg.sticker && !msg.animation && !msg.video_note && !msg.contact
+        && !msg.location && !msg.poll;
+}
+
+async function sendReplyHeader(token, basePayload, prefixInfo) {
+    const fullPrefix = prefixInfo.prefix + prefixInfo.quotedText + prefixInfo.separator;
+    return tgRequest(token, 'sendMessage', {
+        ...basePayload,
+        text: fullPrefix.trimEnd(),
+        entities: [{ type: 'blockquote', offset: prefixInfo.blockquoteOffset, length: prefixInfo.blockquoteLength }],
+    });
+}
+
+async function forwardMessageWithReply(token, targetChatId, fromChatId, msg, threadId) {
+    const prefixInfo = buildReplyPrefix(msg.reply_to_message);
+    const fullPrefix = prefixInfo.prefix + prefixInfo.quotedText + prefixInfo.separator;
+    const basePayload = { chat_id: targetChatId };
+    if (threadId) basePayload.message_thread_id = threadId;
+
+    if (isTextOnlyMessage(msg)) {
+        return tgRequest(token, 'sendMessage', {
+            ...basePayload,
+            text: fullPrefix + msg.text,
+            entities: buildReplyEntities(prefixInfo, msg.entities),
+        });
+    }
+
+    const caption = fullPrefix + (msg.caption || '');
+    const captionEntities = buildReplyEntities(prefixInfo, msg.caption_entities);
+    const mediaPayload = { ...basePayload, caption, caption_entities: captionEntities };
+
+    if (msg.photo) return tgRequest(token, 'sendPhoto', { ...mediaPayload, photo: msg.photo[msg.photo.length - 1].file_id });
+    if (msg.video) return tgRequest(token, 'sendVideo', { ...mediaPayload, video: msg.video.file_id });
+    if (msg.animation) return tgRequest(token, 'sendAnimation', { ...mediaPayload, animation: msg.animation.file_id });
+    if (msg.document) return tgRequest(token, 'sendDocument', { ...mediaPayload, document: msg.document.file_id });
+    if (msg.audio) return tgRequest(token, 'sendAudio', { ...mediaPayload, audio: msg.audio.file_id });
+    if (msg.voice) return tgRequest(token, 'sendVoice', { ...mediaPayload, voice: msg.voice.file_id });
+
+    const headerResult = await sendReplyHeader(token, basePayload, prefixInfo);
+    if (!headerResult.ok) return headerResult;
+
+    const copyPayload = { chat_id: targetChatId, from_chat_id: fromChatId, message_id: msg.message_id };
+    if (threadId) copyPayload.message_thread_id = threadId;
+    return tgRequest(token, 'copyMessage', copyPayload);
 }
 
 const jsonResponse = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } });
@@ -181,7 +280,7 @@ export default {
                 ctx.waitUntil(handleUpdate(env, update, ctx));
                 return jsonResponse({ ok: true });
             }
-            return jsonResponse({ status: 'running', version: '1.1.6 (Standalone)' });
+            return jsonResponse({ status: 'running', version: '1.1.8 (Standalone)' });
         } catch (e) {
             ctx.waitUntil(reportError(env, e, "Main Fetch Loop"));
             return errorResponse(e.message);
@@ -309,6 +408,10 @@ async function handleUpdate(env, update, ctx) {
 const mediaGroupBuffers = new Map();
 
 async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null) {
+    if (msg.reply_to_message && !msg.media_group_id) {
+        return forwardMessageWithReply(token, targetChatId, fromChatId, msg, threadId);
+    }
+
     if (!msg.media_group_id) {
         const payload = { chat_id: targetChatId, from_chat_id: fromChatId, message_id: msg.message_id };
         if (threadId) payload.message_thread_id = threadId;
@@ -320,7 +423,7 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
     const isFirst = !buffer;
 
     if (isFirst) {
-        buffer = { messageIds: [], targetChatId, fromChatId, threadId, token, lastUpdate: 0 };
+        buffer = { messageIds: [], targetChatId, fromChatId, threadId, token, lastUpdate: 0, replyTo: msg.reply_to_message || null };
         mediaGroupBuffers.set(groupKey, buffer);
     }
 
@@ -338,6 +441,13 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
             if (Date.now() - buffer.lastUpdate >= 300) break;
         }
         mediaGroupBuffers.delete(groupKey);
+
+        if (buffer.replyTo) {
+            const prefixInfo = buildReplyPrefix(buffer.replyTo);
+            const basePayload = { chat_id: buffer.targetChatId };
+            if (buffer.threadId) basePayload.message_thread_id = buffer.threadId;
+            await sendReplyHeader(buffer.token, basePayload, prefixInfo);
+        }
 
         buffer.messageIds.sort((a, b) => a - b);
         const payload = { chat_id: buffer.targetChatId, from_chat_id: buffer.fromChatId, message_ids: buffer.messageIds };
@@ -447,7 +557,7 @@ async function handleOwnerMenu(env, msg, ctx) {
     let text = msg.text || '';
 
     if (text === '/start') {
-        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，机器人管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.6 (Standalone) \n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看帮助文档', url: 'https://t.me/RelayGo/14' }]] } });
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，机器人管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.8 (Standalone) \n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看帮助文档', url: 'https://t.me/RelayGo/14' }]] } });
     }
 
     if (['/menu', '/cancel'].includes(text)) {
