@@ -65,6 +65,22 @@ function getMessageTextContent(msg) {
     return '[消息]';
 }
 
+function isServiceMessage(msg) {
+    return !!(msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_reopened
+        || msg.forum_topic_closed || msg.general_forum_topic_hidden || msg.general_forum_topic_unhidden);
+}
+
+// 话题内未显式回复的消息会自动关联到话题根消息（服务消息），不应视为回复
+function shouldFormatAsReply(msg) {
+    if (!msg.reply_to_message) return false;
+    const replied = msg.reply_to_message;
+    if (isServiceMessage(replied)) return false;
+    if (msg.is_topic_message && msg.message_thread_id && replied.message_id === msg.message_thread_id) {
+        return false;
+    }
+    return true;
+}
+
 function buildReplyPrefix(replyToMsg) {
     const prefix = '回复： ';
     const quotedText = getMessageTextContent(replyToMsg);
@@ -408,7 +424,7 @@ async function handleUpdate(env, update, ctx) {
 const mediaGroupBuffers = new Map();
 
 async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadId = null) {
-    if (msg.reply_to_message && !msg.media_group_id) {
+    if (shouldFormatAsReply(msg) && !msg.media_group_id) {
         return forwardMessageWithReply(token, targetChatId, fromChatId, msg, threadId);
     }
 
@@ -423,7 +439,7 @@ async function forwardMessage(env, token, targetChatId, fromChatId, msg, threadI
     const isFirst = !buffer;
 
     if (isFirst) {
-        buffer = { messageIds: [], targetChatId, fromChatId, threadId, token, lastUpdate: 0, replyTo: msg.reply_to_message || null };
+        buffer = { messageIds: [], targetChatId, fromChatId, threadId, token, lastUpdate: 0, replyTo: shouldFormatAsReply(msg) ? msg.reply_to_message : null };
         mediaGroupBuffers.set(groupKey, buffer);
     }
 
