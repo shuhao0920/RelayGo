@@ -647,9 +647,11 @@ async function handleOwnerMenu(env, msg, ctx) {
         let cursor = undefined;
         const allKeys = [];
         while (true) {
-            const res = await env.KV.list({ prefix: 'user:', cursor });
-            allKeys.push(...res.keys);
-            if (res.list_complete) break;
+            const listOpts = { prefix: 'user:' };
+            if (cursor) listOpts.cursor = cursor;
+            const res = await env.KV.list(listOpts);
+            if (res && res.keys) allKeys.push(...res.keys);
+            if (!res || res.list_complete) break;
             cursor = res.cursor;
         }
 
@@ -679,7 +681,7 @@ async function handleOwnerMenu(env, msg, ctx) {
                 const result = await tgRequest(token, 'sendMessage', { chat_id: uid, text: broadcastMsg });
                 if (result.ok) sent++; else failed++;
             } catch (e) { failed++; }
-            if ((sent + failed) % 25 === 0) await new Promise(r => setTimeout(r, 1000));
+            if ((sent + failed) > 0 && (sent + failed) % 25 === 0) await new Promise(r => setTimeout(r, 1000));
         }
 
         return { sent: offset + sent, failed, skipped, total, hasMore: offset + sent + skipped < total && !timedOut, nextOffset: offset + sent + skipped, timedOut };
@@ -955,7 +957,15 @@ async function initializeUser(env, groupId, msg, userId, token, options = {}) {
             ? `⚠️ <b>会话已恢复</b>\n\n原话题已被删除，已自动创建新会话。\n\n${userDetails}`
             : `👤 <b>新用户接入</b>\n\n${userDetails}`;
 
-        await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: "👉 点击查看", url: uidLink }]] } });
+        const sendRes = await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: infoMsg, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: "👉 点击查看", url: uidLink }]] } });
+        if (!sendRes || !sendRes.ok) {
+            console.error(`[NewUserCard Fail] User ${userId}: ${sendRes?.description}, falling back to name mention.`);
+            const nameMention = `<a href="tg://user?id=${userId}">${fullName}</a>`;
+            const fallbackText = recreate
+                ? `⚠️ ${nameMention} (ID: <code>${userId}</code>) 会话已恢复`
+                : `👤 ${nameMention} (ID: <code>${userId}</code>) 已加入会话`;
+            await tgRequest(token, 'sendMessage', { chat_id: groupId, message_thread_id: threadId, text: fallbackText, parse_mode: 'HTML' });
+        }
         if (!recreate) await sendWelcomeMessage(env, userId);
 
         if (!msg.text || !msg.text.startsWith('/start')) {
