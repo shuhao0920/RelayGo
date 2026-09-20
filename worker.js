@@ -66,8 +66,14 @@ function getMessageTextContent(msg) {
 }
 
 function isServiceMessage(msg) {
+    if (!msg) return false;
     return !!(msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_reopened
-        || msg.forum_topic_closed || msg.general_forum_topic_hidden || msg.general_forum_topic_unhidden);
+        || msg.forum_topic_closed || msg.general_forum_topic_hidden || msg.general_forum_topic_unhidden
+        || msg.pinned_message || msg.new_chat_members || msg.left_chat_member
+        || msg.new_chat_title || msg.new_chat_photo || msg.delete_chat_photo
+        || msg.group_chat_created || msg.supergroup_chat_created || msg.channel_chat_created
+        || msg.message_auto_delete_timer_changed || msg.video_chat_scheduled
+        || msg.video_chat_started || msg.video_chat_ended || msg.video_chat_participants_invited);
 }
 
 // 话题内未显式回复的消息会自动关联到话题根消息（服务消息），不应视为回复
@@ -514,6 +520,62 @@ async function generateSettingsMenu(env) {
     return { text: info, reply_markup: keyboard };
 }
 
+function isUserBlockedError(result) {
+    if (!result || result.ok) return false;
+    const desc = (result.description || '').toLowerCase();
+    return desc.includes('bot was blocked by the user')
+        || desc.includes('user is deactivated')
+        || desc.includes('chat not found')
+        || desc.includes('bot was kicked')
+        || desc.includes('blocked');
+}
+
+const broadcastMediaGroupBuffers = new Map();
+
+async function setBroadcastState(env, id, state) {
+    const key = `broadcast_state:${id}`;
+    if (state) {
+        memSet(key, state);
+        await env.KV.put(key, state, { expirationTtl: 3600 });
+    } else {
+        memDelete(key);
+        await env.KV.delete(key);
+    }
+}
+
+async function getBroadcastState(env, id) {
+    const key = `broadcast_state:${id}`;
+    let val = memGet(key);
+    if (val === undefined) {
+        val = await env.KV.get(key);
+        if (val) memSet(key, val);
+    }
+    return val;
+}
+
+async function setBroadcastDraft(env, id, draft) {
+    const key = `broadcast_draft:${id}`;
+    if (draft) {
+        const str = JSON.stringify(draft);
+        memSet(key, str);
+        await env.KV.put(key, str, { expirationTtl: 86400 });
+    } else {
+        memDelete(key);
+        await env.KV.delete(key);
+    }
+}
+
+async function getBroadcastDraft(env, id) {
+    const key = `broadcast_draft:${id}`;
+    let str = memGet(key);
+    if (str === undefined) {
+        str = await env.KV.get(key);
+        if (str) memSet(key, str);
+    }
+    if (!str) return null;
+    try { return JSON.parse(str); } catch (e) { return { text: str }; }
+}
+
 async function handleOwnerCallback(env, query) {
     const token = env.BOT_TOKEN;
     const data = query.data;
@@ -557,7 +619,8 @@ async function handleOwnerCallback(env, query) {
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
     }
     else if (data === 'guide_broadcast') {
-        const text = `📢 <b>消息广播</b>\n\n👉 <b>发送:</b>\n发送 <code>/broadcast</code> {广播内容}\n\n发送 /cancel 返回`;
+        await setBroadcastState(env, chatId, 'waiting_content');
+        const text = `📢 <b>创建消息广播</b>\n\n请直接发送您要广播的消息内容（支持文本、富文本、图片、视频、文件及图文相册）。\n\n发送 /cancel 可取消操作。`;
         await tgRequest(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text: text, parse_mode: 'HTML' });
         return tgRequest(token, 'answerCallbackQuery', { callback_query_id: query.id });
     }
@@ -576,9 +639,183 @@ async function handleOwnerMenu(env, msg, ctx) {
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: `👋 您好，机器人管理员！\n\n您看到此消息说明机器人已成功启动。\n\n当前版本：1.1.8 (Standalone) \n发送 /menu 显示管理菜单`, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '查看帮助文档', url: 'https://t.me/RelayGo/14' }]] } });
     }
 
-    if (['/menu', '/cancel'].includes(text)) {
+    if (text === '/menu') {
         const menu = await generateSettingsMenu(env);
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: menu.text, parse_mode: 'HTML', reply_markup: menu.reply_markup });
+    }
+
+    if (['/cancel', '/bcancel'].includes(text)) {
+        await setBroadcastState(env, chatId, null);
+        await setBroadcastDraft(env, chatId, null);
+        return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 已取消广播操作。" });
+    }
+
+    // 分批广播辅助函数
+    async function sendBroadcastBatch(env, token, chatId, draft, offset, batchSize) {
+        let cursor = undefined;
+        const allKeys = [];
+        while (true) {
+            const listOpts = { prefix: 'user:' };
+            if (cursor) listOpts.cursor = cursor;
+            const res = await env.KV.list(listOpts);
+            if (res && res.keys) allKeys.push(...res.keys);
+            if (!res || res.list_complete) break;
+            cursor = res.cursor;
+        }
+
+        const total = allKeys.length;
+        const batch = allKeys.slice(offset, offset + batchSize);
+
+        let sent = 0, failed = 0, skipped = 0;
+        const startTime = Date.now();
+        const maxDuration = 25000;
+        let timedOut = false;
+
+        for (const key of batch) {
+            if (Date.now() - startTime > maxDuration) {
+                timedOut = true;
+                break;
+            }
+            const uid = key.name.split(':')[1];
+
+            // 检查用户是否被封禁
+            const userData = await env.KV.get(`user:${uid}`, { type: 'json' });
+            if (userData && userData.is_banned) {
+                skipped++;
+                continue;
+            }
+
+            try {
+                let result;
+                if (draft.message_ids && draft.message_ids.length > 0) {
+                    result = await tgRequest(token, 'copyMessages', { chat_id: uid, from_chat_id: draft.from_chat_id, message_ids: draft.message_ids });
+                } else if (draft.message_id) {
+                    result = await tgRequest(token, 'copyMessage', { chat_id: uid, from_chat_id: draft.from_chat_id, message_id: draft.message_id });
+                } else if (typeof draft.text === 'string') {
+                    result = await tgRequest(token, 'sendMessage', { chat_id: uid, text: draft.text });
+                }
+                if (result && result.ok) sent++; else failed++;
+            } catch (e) { failed++; }
+            if ((sent + failed) > 0 && (sent + failed) % 25 === 0) await new Promise(r => setTimeout(r, 1000));
+        }
+
+        return { sent: offset + sent, failed, skipped, total, hasMore: offset + sent + skipped < total && !timedOut, nextOffset: offset + sent + skipped, timedOut };
+    }
+
+    // 广播状态检查
+    const broadcastState = await getBroadcastState(env, chatId);
+
+    if (broadcastState === 'waiting_confirm') {
+        if (text === '/confirm') {
+            await setBroadcastState(env, chatId, null);
+            const draft = await getBroadcastDraft(env, chatId);
+            if (!draft) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 未找到广播草稿，请重新使用 /broadcast 开始。" });
+
+            await tgRequest(token, 'sendMessage', { chat_id: chatId, text: "🔄 <b>已开始发送广播...</b>", parse_mode: 'HTML' });
+            const result = await sendBroadcastBatch(env, token, chatId, draft, 0, 500);
+            const statusIcon = result.timedOut ? '⚠️' : '✅';
+            const statusText = result.timedOut ? '部分完成（超时）' : '完成';
+            return tgRequest(token, 'sendMessage', {
+                chat_id: chatId,
+                text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}${result.hasMore ? `\n\n继续发送：/bcontinue ${result.nextOffset}` : ''}`,
+                parse_mode: 'HTML'
+            });
+        } else {
+            return tgRequest(token, 'sendMessage', {
+                chat_id: chatId,
+                text: "⚠️ <b>请确认广播内容</b>\n\n如需发送，请发送 <code>/confirm</code> 确认发布；\n如需取消，请发送 <code>/cancel</code> 。",
+                parse_mode: 'HTML'
+            });
+        }
+    }
+
+    if (broadcastState === 'waiting_content') {
+        if (msg.media_group_id) {
+            const groupKey = `broadcast:${chatId}:${msg.media_group_id}`;
+            let buffer = broadcastMediaGroupBuffers.get(groupKey);
+            const isFirst = !buffer;
+
+            if (isFirst) {
+                buffer = { messageIds: [], lastUpdate: 0 };
+                broadcastMediaGroupBuffers.set(groupKey, buffer);
+            }
+
+            if (!buffer.messageIds.includes(msg.message_id)) {
+                buffer.messageIds.push(msg.message_id);
+            }
+            buffer.lastUpdate = Date.now();
+
+            if (isFirst) {
+                const maxWait = Date.now() + 3000;
+                while (Date.now() < maxWait) {
+                    await new Promise(r => setTimeout(r, 300));
+                    if (Date.now() - buffer.lastUpdate >= 300) break;
+                }
+                broadcastMediaGroupBuffers.delete(groupKey);
+
+                buffer.messageIds.sort((a, b) => a - b);
+                const draft = { from_chat_id: chatId, message_ids: buffer.messageIds };
+                await setBroadcastDraft(env, chatId, draft);
+                await setBroadcastState(env, chatId, 'waiting_confirm');
+
+                await tgRequest(token, 'copyMessages', { chat_id: chatId, from_chat_id: chatId, message_ids: buffer.messageIds });
+                return tgRequest(token, 'sendMessage', {
+                    chat_id: chatId,
+                    text: "📢 <b>广播预览如上</b>\n\n如确认无误，请发送 <code>/confirm</code> 开始发布广播；\n如需取消，请发送 <code>/cancel</code> 。",
+                    parse_mode: 'HTML'
+                });
+            }
+            return;
+        } else {
+            const draft = { from_chat_id: chatId, message_id: msg.message_id };
+            await setBroadcastDraft(env, chatId, draft);
+            await setBroadcastState(env, chatId, 'waiting_confirm');
+
+            await tgRequest(token, 'copyMessage', { chat_id: chatId, from_chat_id: chatId, message_id: msg.message_id });
+            return tgRequest(token, 'sendMessage', {
+                chat_id: chatId,
+                text: "📢 <b>广播预览如上</b>\n\n如确认无误，请发送 <code>/confirm</code> 开始发布广播；\n如需取消，请发送 <code>/cancel</code> 。",
+                parse_mode: 'HTML'
+            });
+        }
+    }
+
+    if (text.startsWith('/broadcast')) {
+        const bodyContent = text.replace('/broadcast', '').trim();
+        if (bodyContent.length > 0) {
+            const draft = { from_chat_id: chatId, message_id: msg.message_id };
+            await setBroadcastDraft(env, chatId, draft);
+            await setBroadcastState(env, chatId, 'waiting_confirm');
+
+            await tgRequest(token, 'copyMessage', { chat_id: chatId, from_chat_id: chatId, message_id: msg.message_id });
+            return tgRequest(token, 'sendMessage', {
+                chat_id: chatId,
+                text: "📢 <b>广播预览如上</b>\n\n如确认无误，请发送 <code>/confirm</code> 开始发布广播；\n如需取消，请发送 <code>/cancel</code> 。",
+                parse_mode: 'HTML'
+            });
+        } else {
+            await setBroadcastState(env, chatId, 'waiting_content');
+            return tgRequest(token, 'sendMessage', {
+                chat_id: chatId,
+                text: "📢 <b>创建消息广播</b>\n\n请直接发送您要广播的消息内容（支持文本、富文本、图片、视频、文件及图文相册）。\n\n发送 /cancel 可取消操作。",
+                parse_mode: 'HTML'
+            });
+        }
+    }
+
+    if (text.startsWith('/bcontinue')) {
+        const offset = parseInt(text.split(' ')[1]) || 0;
+        const draft = await getBroadcastDraft(env, chatId);
+        if (!draft) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 未找到广播内容，请先使用 /broadcast 开始广播" });
+
+        const result = await sendBroadcastBatch(env, token, chatId, draft, offset, 500);
+        const statusIcon = result.timedOut ? '⚠️' : '✅';
+        const statusText = result.timedOut ? '部分完成（超时）' : '完成';
+        return tgRequest(token, 'sendMessage', {
+            chat_id: chatId,
+            text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}${result.hasMore ? `\n\n继续发送：/bcontinue ${result.nextOffset}` : ''}`,
+            parse_mode: 'HTML'
+        });
     }
 
     // 手动封禁/解封
@@ -642,82 +879,6 @@ async function handleOwnerMenu(env, msg, ctx) {
         memDelete('config:auto_reply_msg');
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 自动回复已更新。" });
     }
-    // 分批广播辅助函数
-    async function sendBroadcastBatch(env, token, chatId, broadcastMsg, offset, batchSize) {
-        let cursor = undefined;
-        const allKeys = [];
-        while (true) {
-            const listOpts = { prefix: 'user:' };
-            if (cursor) listOpts.cursor = cursor;
-            const res = await env.KV.list(listOpts);
-            if (res && res.keys) allKeys.push(...res.keys);
-            if (!res || res.list_complete) break;
-            cursor = res.cursor;
-        }
-
-        const total = allKeys.length;
-        const batch = allKeys.slice(offset, offset + batchSize);
-
-        let sent = 0, failed = 0, skipped = 0;
-        const startTime = Date.now();
-        const maxDuration = 25000;
-        let timedOut = false;
-
-        for (const key of batch) {
-            if (Date.now() - startTime > maxDuration) {
-                timedOut = true;
-                break;
-            }
-            const uid = key.name.split(':')[1];
-
-            // 检查用户是否被封禁
-            const userData = await env.KV.get(`user:${uid}`, { type: 'json' });
-            if (userData && userData.is_banned) {
-                skipped++;
-                continue;
-            }
-
-            try {
-                const result = await tgRequest(token, 'sendMessage', { chat_id: uid, text: broadcastMsg });
-                if (result.ok) sent++; else failed++;
-            } catch (e) { failed++; }
-            if ((sent + failed) > 0 && (sent + failed) % 25 === 0) await new Promise(r => setTimeout(r, 1000));
-        }
-
-        return { sent: offset + sent, failed, skipped, total, hasMore: offset + sent + skipped < total && !timedOut, nextOffset: offset + sent + skipped, timedOut };
-    }
-
-    if (text.startsWith('/broadcast ')) {
-        const broadcastMsg = text.replace('/broadcast ', '').trim();
-        if (!broadcastMsg) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 消息内容不能为空。" });
-
-        // 保存消息到 KV
-        await env.KV.put(`broadcast_msg:${chatId}`, broadcastMsg, { expirationTtl: 86400 });
-
-        // 发送第一批
-        const result = await sendBroadcastBatch(env, token, chatId, broadcastMsg, 0, 500);
-        const statusIcon = result.timedOut ? '⚠️' : '✅';
-        const statusText = result.timedOut ? '部分完成（超时）' : '完成';
-        return tgRequest(token, 'sendMessage', {
-            chat_id: chatId,
-            text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}${result.hasMore ? `\n\n继续发送：/bcontinue ${result.nextOffset}` : ''}`,
-            parse_mode: 'HTML'
-        });
-    }
-    if (text.startsWith('/bcontinue')) {
-        const offset = parseInt(text.split(' ')[1]) || 0;
-        const broadcastMsg = await env.KV.get(`broadcast_msg:${chatId}`);
-        if (!broadcastMsg) return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "❌ 未找到广播消息，请先使用 /broadcast 开始广播" });
-
-        const result = await sendBroadcastBatch(env, token, chatId, broadcastMsg, offset, 500);
-        const statusIcon = result.timedOut ? '⚠️' : '✅';
-        const statusText = result.timedOut ? '部分完成（超时）' : '完成';
-        return tgRequest(token, 'sendMessage', {
-            chat_id: chatId,
-            text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}${result.hasMore ? `\n\n继续发送：/bcontinue ${result.nextOffset}` : ''}`,
-            parse_mode: 'HTML'
-        });
-    }
     if (text === '/bcancel') {
         await env.KV.delete(`broadcast_msg:${chatId}`);
         return tgRequest(token, 'sendMessage', { chat_id: chatId, text: "✅ 已取消广播" });
@@ -728,6 +889,7 @@ async function handleOwnerMenu(env, msg, ctx) {
 // 处理群组消息 (Topic 内回复)
 async function handleGroupMessage(env, msg) {
     if (!msg.is_topic_message || !msg.message_thread_id) return;
+    if (isServiceMessage(msg) || (msg.from && msg.from.is_bot)) return;
 
     // 通过 Thread ID 反查 User ID
     const userId = String(await env.KV.get(`thread:${msg.message_thread_id}`));
@@ -751,7 +913,24 @@ async function handleGroupMessage(env, msg) {
             return tgRequest(env.BOT_TOKEN, 'sendMessage', { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "✅ 用户已解除封禁。" });
         }
     }
-    await forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg);
+    const result = await forwardMessage(env, env.BOT_TOKEN, userId, msg.chat.id, msg);
+    if (result && !result.ok) {
+        if (isUserBlockedError(result)) {
+            await tgRequest(env.BOT_TOKEN, 'sendMessage', {
+                chat_id: msg.chat.id,
+                message_thread_id: msg.message_thread_id,
+                text: "⚠️ <b>消息发送失败</b>\n\n该用户已拉黑机器人或账号已注销，消息无法转达。",
+                parse_mode: 'HTML'
+            });
+        } else {
+            await tgRequest(env.BOT_TOKEN, 'sendMessage', {
+                chat_id: msg.chat.id,
+                message_thread_id: msg.message_thread_id,
+                text: `⚠️ <b>消息发送失败</b>\n\n错误提示：${escapeHtml(result.description || '未知错误')}`,
+                parse_mode: 'HTML'
+            });
+        }
+    }
 }
 
 // 用户私聊核心逻辑
