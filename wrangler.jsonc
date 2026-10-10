@@ -1,0 +1,12 @@
+{
+  "name": "relaygo",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-09",
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "e4f36eb92f1a4a28bd5130d4de62a65b"
+    }
+  ],
+  // ...
+}
