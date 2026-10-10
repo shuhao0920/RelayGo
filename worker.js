@@ -185,7 +185,7 @@ async function reactToMessage(token, chatId, messageId) {
     return tgRequest(token, 'setMessageReaction', {
         chat_id: chatId,
         message_id: messageId,
-        reaction: [{ type: 'emoji', emoji: '👍' }],
+        reaction: [{ type: 'emoji', emoji: '🐳' }],
         is_big: false,
     });
 }
